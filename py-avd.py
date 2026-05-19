@@ -15,136 +15,13 @@ from __future__ import annotations
 import os
 import platform
 import queue
-import shutil
 import subprocess
-import threading
 from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, messagebox, scrolledtext
-
-
-class StreamReader(threading.Thread):
-    def __init__(self, pipe, output_queue: queue.Queue, prefix: str = ""):
-        super().__init__(daemon=True)
-        self.pipe = pipe
-        self.output_queue = output_queue
-        self.prefix = prefix
-
-    def run(self) -> None:
-        try:
-            for line in iter(self.pipe.readline, ""):
-                if not line:
-                    break
-                self.output_queue.put(f"{self.prefix}{line}")
-        except Exception as exc:
-            self.output_queue.put(f"[reader-error] {exc}\n")
-        finally:
-            try:
-                self.pipe.close()
-            except Exception:
-                pass
-
-
-class AndroidSdkPaths:
-    def __init__(self, sdk_root: str):
-        self.sdk_root = Path(sdk_root).expanduser()
-
-    @staticmethod
-    def default_sdk_root() -> str:
-        env = os.environ.get("ANDROID_SDK_ROOT") or os.environ.get("ANDROID_HOME")
-        if env:
-            return env
-
-        system = platform.system()
-        home = Path.home()
-
-        candidates = []
-        if system == "Darwin":
-            candidates = [
-                home / "Library" / "Android" / "sdk",
-            ]
-        elif system == "Linux":
-            candidates = [
-                home / "Android" / "Sdk",
-                home / "Android" / "sdk",
-            ]
-        elif system == "Windows":
-            local = os.environ.get("LOCALAPPDATA")
-            userprofile = os.environ.get("USERPROFILE")
-            if local:
-                candidates.append(Path(local) / "Android" / "Sdk")
-            if userprofile:
-                candidates.append(Path(userprofile) / "AppData" / "Local" / "Android" / "Sdk")
-
-        for candidate in candidates:
-            if candidate.exists():
-                return str(candidate)
-
-        return str(candidates[0] if candidates else home / "Android" / "Sdk")
-
-    @staticmethod
-    def _first_existing(paths: list[Path]) -> str:
-        for path in paths:
-            if path.exists():
-                return str(path)
-        return str(paths[0])
-
-    def emulator_bin(self) -> str:
-        system = platform.system()
-        if system == "Windows":
-            candidates = [
-                self.sdk_root / "emulator" / "emulator.exe",
-                self.sdk_root / "emulator" / "emulator",
-            ]
-        else:
-            candidates = [
-                self.sdk_root / "emulator" / "emulator",
-                self.sdk_root / "emulator" / "emulator.exe",
-            ]
-        return self._first_existing(candidates)
-
-    def avdmanager_bin(self) -> str:
-        system = platform.system()
-        if system == "Windows":
-            candidates = [
-                self.sdk_root / "cmdline-tools" / "latest" / "bin" / "avdmanager.bat",
-                self.sdk_root / "cmdline-tools" / "latest" / "bin" / "avdmanager.exe",
-                self.sdk_root / "tools" / "bin" / "avdmanager.bat",
-            ]
-        else:
-            candidates = [
-                self.sdk_root / "cmdline-tools" / "latest" / "bin" / "avdmanager",
-                self.sdk_root / "tools" / "bin" / "avdmanager",
-            ]
-        return self._first_existing(candidates)
-
-    def sdkmanager_bin(self) -> str:
-        system = platform.system()
-        if system == "Windows":
-            candidates = [
-                self.sdk_root / "cmdline-tools" / "latest" / "bin" / "sdkmanager.bat",
-                self.sdk_root / "cmdline-tools" / "latest" / "bin" / "sdkmanager.exe",
-                self.sdk_root / "tools" / "bin" / "sdkmanager.bat",
-            ]
-        else:
-            candidates = [
-                self.sdk_root / "cmdline-tools" / "latest" / "bin" / "sdkmanager",
-                self.sdk_root / "tools" / "bin" / "sdkmanager",
-            ]
-        return self._first_existing(candidates)
-
-    def platform_tools_dir(self) -> str:
-        return str(self.sdk_root / "platform-tools")
-
-    def emulator_dir(self) -> str:
-        return str(self.sdk_root / "emulator")
-
-    def cmdline_tools_dir(self) -> str:
-        latest = self.sdk_root / "cmdline-tools" / "latest" / "bin"
-        legacy = self.sdk_root / "tools" / "bin"
-        if latest.exists():
-            return str(latest)
-        return str(legacy)
+from services.avd_service import AvdService
+from services.process_runner import ProcessRunner
+from services.sdk_paths import AndroidSdkPaths
 
 
 class EmulatorManagerApp(tk.Tk):
@@ -158,6 +35,8 @@ class EmulatorManagerApp(tk.Tk):
 
         self.log_queue: queue.Queue[str] = queue.Queue()
         self.emulator_process: subprocess.Popen | None = None
+        self.runner = ProcessRunner("", self.log_queue)
+        self.avd_service = AvdService(self.runner)
 
         self.android_sdk_root_var = tk.StringVar(value=AndroidSdkPaths.default_sdk_root())
         self.emulator_bin_var = tk.StringVar()
@@ -167,25 +46,14 @@ class EmulatorManagerApp(tk.Tk):
 
         self.selected_avd_var = tk.StringVar()
         self.create_name_var = tk.StringVar()
-        self.create_package_var = tk.StringVar(value=self._default_image_package())
-        self.create_device_var = tk.StringVar(value=self._default_device_id())
+        self.create_package_var = tk.StringVar(value=self.avd_service.default_image_package())
+        self.create_device_var = tk.StringVar(value=self.avd_service.default_device_id())
         self.create_force_var = tk.BooleanVar(value=False)
 
         self._build_ui()
         self._refresh_derived_paths()
         self.after(100, self._poll_log_queue)
         self.after(150, self._initial_load)
-
-    def _default_image_package(self) -> str:
-        if platform.system() == "Windows":
-            return "system-images;android-33;google_apis_playstore;x86_64"
-        if platform.system() == "Linux":
-            return "system-images;android-33;google_apis_playstore;x86_64"
-        return "system-images;android-33;google_apis_playstore;arm64-v8a"
-
-    def _default_device_id(self) -> str:
-        return "pixel_3a"
-
 
     def _initial_load(self) -> None:
         self._append_log("[startup] Verificando rutas iniciales y cargando AVDs...\n")
@@ -330,10 +198,11 @@ class EmulatorManagerApp(tk.Tk):
     # ---------------- Helpers ----------------
 
     def _refresh_derived_paths(self) -> None:
-        paths = AndroidSdkPaths(self.android_sdk_root_var.get())
-        self.emulator_bin_var.set(paths.emulator_bin())
-        self.avdmanager_bin_var.set(paths.avdmanager_bin())
-        self.sdkmanager_bin_var.set(paths.sdkmanager_bin())
+        self.avd_service.set_sdk_root(self.android_sdk_root_var.get())
+        paths = self.avd_service.derived_paths()
+        self.emulator_bin_var.set(paths["emulator"])
+        self.avdmanager_bin_var.set(paths["avdmanager"])
+        self.sdkmanager_bin_var.set(paths["sdkmanager"])
 
     def _append_log(self, text: str) -> None:
         self.log_text.insert("end", text)
@@ -359,106 +228,34 @@ class EmulatorManagerApp(tk.Tk):
         self.selected_avd_var.set(name)
 
     def _build_env(self) -> dict[str, str]:
-        env = os.environ.copy()
-        sdk_root = self.android_sdk_root_var.get().strip()
-        paths = AndroidSdkPaths(sdk_root)
-
-        env["ANDROID_SDK_ROOT"] = sdk_root
-        env["ANDROID_HOME"] = sdk_root
-
-        prepend_paths = [
-            paths.emulator_dir(),
-            paths.platform_tools_dir(),
-            paths.cmdline_tools_dir(),
-        ]
-
-        env["PATH"] = os.pathsep.join(prepend_paths + [env.get("PATH", "")])
-        return env
+        self.avd_service.set_sdk_root(self.android_sdk_root_var.get())
+        return self.runner.build_env()
 
     def _run_sync(self, cmd: list[str], title: str) -> tuple[int, str]:
-        try:
-            self._append_log(f"\n[{title}] Ejecutando: {' '.join(cmd)}\n")
-            proc = subprocess.run(
-                cmd,
-                env=self._build_env(),
-                capture_output=True,
-                text=True,
-                check=False,
-                shell=False,
-            )
-            output = (proc.stdout or "") + (proc.stderr or "")
-            if output:
-                self._append_log(output + ("\n" if not output.endswith("\n") else ""))
-            self._append_log(f"[{title}] exit={proc.returncode}\n")
-            return proc.returncode, output
-        except Exception as exc:
-            msg = f"[{title}] error: {exc}\n"
-            self._append_log(msg)
-            return 1, msg
+        self.avd_service.set_sdk_root(self.android_sdk_root_var.get())
+        return self.runner.run_sync(cmd, title)
 
     def _run_async(self, cmd: list[str], title: str, cwd: str | None = None) -> subprocess.Popen | None:
-        try:
-            self._append_log(f"\n[{title}] Ejecutando: {' '.join(cmd)}\n")
-            if cwd:
-                self._append_log(f"[{title}] cwd={cwd}\n")
-
-            creationflags = 0
-            if platform.system() == "Windows":
-                creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
-
-            proc = subprocess.Popen(
-                cmd,
-                env=self._build_env(),
-                cwd=cwd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                stdin=subprocess.DEVNULL,
-                text=True,
-                bufsize=1,
-                shell=False,
-                creationflags=creationflags,
-            )
-            if proc.stdout:
-                StreamReader(proc.stdout, self.log_queue).start()
-
-            def waiter() -> None:
-                code = proc.wait()
-                self.log_queue.put(f"[{title}] exit={code}\n")
-
-            threading.Thread(target=waiter, daemon=True).start()
-            return proc
-        except Exception as exc:
-            self._append_log(f"[{title}] error: {exc}\n")
-            return None
+        self.avd_service.set_sdk_root(self.android_sdk_root_var.get())
+        return self.runner.run_async(cmd, title, cwd=cwd)
 
     # ---------------- Actions ----------------
 
     def verify_paths(self) -> None:
         self._refresh_derived_paths()
         self._append_log("\n[verify] Verificando rutas...\n")
+        self.avd_service.set_sdk_root(self.android_sdk_root_var.get())
+        report = self.avd_service.verify_paths()
 
-        checks = [
-            ("ANDROID_SDK_ROOT", self.android_sdk_root_var.get()),
-            ("emulator", self.emulator_bin_var.get()),
-            ("avdmanager", self.avdmanager_bin_var.get()),
-            ("sdkmanager", self.sdkmanager_bin_var.get()),
-        ]
+        for check in report.checks:
+            status = "OK" if check.exists else "MISSING"
+            self._append_log(f"[verify] {check.label}: {check.path} -> {status}\n")
 
-        for label, raw_path in checks:
-            path = Path(raw_path).expanduser()
-            exists = path.exists()
-            status = "OK" if exists else "MISSING"
-            self._append_log(f"[verify] {label}: {path} -> {status}\n")
-
-        emulator_on_path = shutil.which(Path(self.emulator_bin_var.get()).name, path=self._build_env().get("PATH"))
         avd_name = Path(self.avdmanager_bin_var.get()).name
         sdk_name = Path(self.sdkmanager_bin_var.get()).name
-        avd_on_path = shutil.which(avd_name, path=self._build_env().get("PATH"))
-        sdk_on_path = shutil.which(sdk_name, path=self._build_env().get("PATH"))
-
-        self._append_log(f"[verify] which emulator -> {emulator_on_path}\n")
-        self._append_log(f"[verify] which {avd_name} -> {avd_on_path}\n")
-        self._append_log(f"[verify] which {sdk_name} -> {sdk_on_path}\n")
+        self._append_log(f"[verify] which emulator -> {report.emulator_on_path}\n")
+        self._append_log(f"[verify] which {avd_name} -> {report.avdmanager_on_path}\n")
+        self._append_log(f"[verify] which {sdk_name} -> {report.sdkmanager_on_path}\n")
 
         self.list_avds(show_popup=False)
 
@@ -468,12 +265,12 @@ class EmulatorManagerApp(tk.Tk):
             messagebox.showerror("Ruta inválida", "No se encontró el binario emulator.")
             return
 
-        code, output = self._run_sync([emulator_bin, "-list-avds"], "list-avds")
+        self.avd_service.set_sdk_root(self.android_sdk_root_var.get())
+        code, avds, _output = self.avd_service.list_avds(emulator_bin=emulator_bin)
         if code != 0:
             messagebox.showerror("Error", "No se pudieron listar los AVDs. Revisa el log.")
             return
 
-        avds = [line.strip() for line in output.splitlines() if line.strip() and not line.startswith("[")]
         self.avd_listbox.delete(0, "end")
         for avd in avds:
             self.avd_listbox.insert("end", avd)
@@ -499,19 +296,15 @@ class EmulatorManagerApp(tk.Tk):
             messagebox.showerror("AVD requerido", "Selecciona o escribe el nombre de un AVD.")
             return
 
-        emulator_dir = str(Path(emulator_bin).resolve().parent)
-        cmd = [emulator_bin, "-avd", avd_name]
-
-        if self.wipe_var.get():
-            cmd.append("-wipe-data")
-        if self.no_snapshot_var.get():
-            cmd.append("-no-snapshot")
-        if self.no_boot_anim_var.get():
-            cmd.append("-no-boot-anim")
-        if self.verbose_var.get():
-            cmd.append("-verbose")
-
-        proc = self._run_async(cmd, f"launch:{avd_name}", cwd=emulator_dir)
+        self.avd_service.set_sdk_root(self.android_sdk_root_var.get())
+        proc = self.avd_service.launch_emulator(
+            avd_name=avd_name,
+            emulator_bin=emulator_bin,
+            wipe_data=self.wipe_var.get(),
+            no_snapshot=self.no_snapshot_var.get(),
+            no_boot_anim=self.no_boot_anim_var.get(),
+            verbose=self.verbose_var.get(),
+        )
         if proc is None:
             messagebox.showerror("Error", "No se pudo iniciar el emulador.")
             return
@@ -543,14 +336,16 @@ class EmulatorManagerApp(tk.Tk):
         if not Path(avdmanager_bin).exists():
             messagebox.showerror("Ruta inválida", "No se encontró avdmanager.")
             return
-        self._run_sync([avdmanager_bin, "list", "device"], "avdmanager-list-device")
+        self.avd_service.set_sdk_root(self.android_sdk_root_var.get())
+        self.avd_service.list_devices(avdmanager_bin=avdmanager_bin)
 
     def list_images(self) -> None:
         sdkmanager_bin = self.sdkmanager_bin_var.get().strip()
         if not Path(sdkmanager_bin).exists():
             messagebox.showerror("Ruta inválida", "No se encontró sdkmanager.")
             return
-        self._run_sync([sdkmanager_bin, "--list"], "sdkmanager-list")
+        self.avd_service.set_sdk_root(self.android_sdk_root_var.get())
+        self.avd_service.list_images(sdkmanager_bin=sdkmanager_bin)
 
     def create_avd(self) -> None:
         avdmanager_bin = self.avdmanager_bin_var.get().strip()
@@ -571,51 +366,27 @@ class EmulatorManagerApp(tk.Tk):
             messagebox.showerror("Dato faltante", "Debes indicar el device id.")
             return
 
-        cmd = [avdmanager_bin, "create", "avd", "-n", name, "-k", package, "-d", device]
-        if self.create_force_var.get():
-            cmd.append("-f")
-
         self._append_log("\n[create-avd] Nota: si la imagen no existe, primero instálala con sdkmanager.\n")
         self._append_log(f"[create-avd] package={package} device={device} name={name}\n")
+        self.avd_service.set_sdk_root(self.android_sdk_root_var.get())
 
-        try:
-            creationflags = 0
-            if platform.system() == "Windows":
-                creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
+        def on_exit(code: int) -> None:
+            if code == 0:
+                self.log_queue.put("[create-avd] AVD creado correctamente.\n")
+                self.after(0, self.list_avds)
+            else:
+                self.log_queue.put("[create-avd] Falló la creación del AVD.\n")
 
-            proc = subprocess.Popen(
-                cmd,
-                env=self._build_env(),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                stdin=subprocess.PIPE,
-                text=True,
-                bufsize=1,
-                shell=False,
-                creationflags=creationflags,
-            )
-
-            if proc.stdin:
-                proc.stdin.write("no\n")
-                proc.stdin.flush()
-                proc.stdin.close()
-
-            if proc.stdout:
-                StreamReader(proc.stdout, self.log_queue).start()
-
-            def waiter() -> None:
-                code = proc.wait()
-                self.log_queue.put(f"[create-avd] exit={code}\n")
-                if code == 0:
-                    self.log_queue.put("[create-avd] AVD creado correctamente.\n")
-                    self.after(0, self.list_avds)
-                else:
-                    self.log_queue.put("[create-avd] Falló la creación del AVD.\n")
-
-            threading.Thread(target=waiter, daemon=True).start()
-
-        except Exception as exc:
-            self._append_log(f"[create-avd] error: {exc}\n")
+        proc = self.avd_service.create_avd(
+            name=name,
+            package=package,
+            device=device,
+            force=self.create_force_var.get(),
+            avdmanager_bin=avdmanager_bin,
+            on_exit=on_exit,
+        )
+        if proc is None:
+            self._append_log("[create-avd] error: no se pudo iniciar el proceso.\n")
 
 
 def main() -> None:
