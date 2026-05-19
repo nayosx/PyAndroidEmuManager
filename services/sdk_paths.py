@@ -91,6 +91,20 @@ class AndroidSdkPaths:
     def platform_tools_dir(self) -> str:
         return str(self.sdk_root / "platform-tools")
 
+    def adb_bin(self) -> str:
+        system = platform.system()
+        if system == "Windows":
+            candidates = [
+                self.sdk_root / "platform-tools" / "adb.exe",
+                self.sdk_root / "platform-tools" / "adb",
+            ]
+        else:
+            candidates = [
+                self.sdk_root / "platform-tools" / "adb",
+                self.sdk_root / "platform-tools" / "adb.exe",
+            ]
+        return self._first_existing(candidates)
+
     def emulator_dir(self) -> str:
         return str(self.sdk_root / "emulator")
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import platform
 import re
 import shutil
@@ -31,6 +32,12 @@ class AvdInfo:
     name: str
     status: str
     config_path: Path | None
+    is_running: bool = False
+    ram_mb: str | None = None
+    heap_mb: str | None = None
+    data_partition: str | None = None
+    image_label: str | None = None
+    device_name: str | None = None
 
 
 @dataclass
@@ -39,6 +46,36 @@ class DeviceInfo:
     name: str
     oem: str | None = None
     tag: str | None = None
+
+
+@dataclass
+class BinaryStatus:
+    label: str
+    path: str
+    exists: bool
+    executable: bool
+    usable: bool
+    detail: str
+
+
+@dataclass
+class EnvironmentStatus:
+    sdk_root: str
+    os_name: str
+    emulator: BinaryStatus
+    avdmanager: BinaryStatus
+    sdkmanager: BinaryStatus
+    can_list_avds: bool
+    can_launch: bool
+    can_create: bool
+    can_edit: bool
+    can_delete: bool
+    can_list_images: bool
+    can_list_devices: bool
+    is_ready: bool
+    needs_setup: bool
+    is_partial: bool
+    summary: str
 
 
 class AvdService:
@@ -69,7 +106,102 @@ class AvdService:
             "emulator": paths.emulator_bin(),
             "avdmanager": paths.avdmanager_bin(),
             "sdkmanager": paths.sdkmanager_bin(),
+            "adb": paths.adb_bin(),
         }
+
+    def _probe_binary(self, label: str, path: str, cmd: list[str], sdk_root: str) -> BinaryStatus:
+        candidate = Path(path).expanduser()
+        exists = candidate.exists()
+        executable = exists and os.access(candidate, os.X_OK)
+        if not exists:
+            return BinaryStatus(label=label, path=str(candidate), exists=False, executable=False, usable=False, detail="No existe")
+        if not executable:
+            return BinaryStatus(label=label, path=str(candidate), exists=True, executable=False, usable=False, detail="No es ejecutable")
+
+        env = self.runner.build_env().copy()
+        env["ANDROID_SDK_ROOT"] = sdk_root
+        env["ANDROID_HOME"] = sdk_root
+
+        try:
+            proc = subprocess.run(cmd, env=env, capture_output=True, text=True, check=False, shell=False)
+            usable = proc.returncode == 0
+            detail = "OK" if usable else f"exit={proc.returncode}"
+            return BinaryStatus(label=label, path=str(candidate), exists=True, executable=True, usable=usable, detail=detail)
+        except Exception as exc:
+            return BinaryStatus(label=label, path=str(candidate), exists=True, executable=True, usable=False, detail=str(exc))
+
+    def validate_environment(
+        self,
+        sdk_root: str | None = None,
+        emulator_path: str | None = None,
+        avdmanager_path: str | None = None,
+        sdkmanager_path: str | None = None,
+        deep: bool = False,
+    ) -> EnvironmentStatus:
+        sdk_root = (sdk_root or self.runner.sdk_root).strip()
+        original_root = self.runner.sdk_root
+        self.runner.set_sdk_root(sdk_root)
+        derived = self.derived_paths()
+
+        emulator_path = (emulator_path or derived["emulator"]).strip()
+        avdmanager_path = (avdmanager_path or derived["avdmanager"]).strip()
+        sdkmanager_path = (sdkmanager_path or derived["sdkmanager"]).strip()
+
+        emulator_cmd = [emulator_path, "-list-avds"] if deep else [emulator_path, "-version"]
+        avdmanager_cmd = [avdmanager_path, "list", "device"] if deep else [avdmanager_path, "list", "target"]
+        sdkmanager_cmd = [sdkmanager_path, "--list"] if deep else [sdkmanager_path, "--version"]
+
+        emulator = self._probe_binary("emulator", emulator_path, emulator_cmd, sdk_root)
+        avdmanager = self._probe_binary("avdmanager", avdmanager_path, avdmanager_cmd, sdk_root)
+        sdkmanager = self._probe_binary("sdkmanager", sdkmanager_path, sdkmanager_cmd, sdk_root)
+
+        sdk_exists = bool(sdk_root) and Path(sdk_root).expanduser().exists()
+        can_list_avds = emulator.usable
+        can_launch = emulator.usable
+        can_create = avdmanager.usable
+        can_edit = True
+        can_delete = avdmanager.usable
+        can_list_images = sdkmanager.usable
+        can_list_devices = avdmanager.usable
+
+        is_ready = sdk_exists and can_list_avds and can_create and can_list_images
+        any_usable = can_list_avds or can_create or can_list_images
+        needs_setup = not sdk_exists or not any_usable
+        is_partial = not is_ready and any_usable
+
+        if is_ready:
+            summary = "Entorno listo." if deep else "Entorno listo (validación rápida)."
+        elif needs_setup:
+            summary = "Faltan rutas o binarios clave del Android SDK."
+        else:
+            missing = []
+            if not can_list_avds:
+                missing.append("emulator")
+            if not can_create:
+                missing.append("avdmanager")
+            if not can_list_images:
+                missing.append("sdkmanager")
+            summary = f"Entorno parcial. Faltan capacidades: {', '.join(missing)}."
+
+        self.runner.set_sdk_root(original_root)
+        return EnvironmentStatus(
+            sdk_root=sdk_root,
+            os_name=platform.system(),
+            emulator=emulator,
+            avdmanager=avdmanager,
+            sdkmanager=sdkmanager,
+            can_list_avds=can_list_avds,
+            can_launch=can_launch,
+            can_create=can_create,
+            can_edit=can_edit,
+            can_delete=can_delete,
+            can_list_images=can_list_images,
+            can_list_devices=can_list_devices,
+            is_ready=is_ready,
+            needs_setup=needs_setup,
+            is_partial=is_partial,
+            summary=summary,
+        )
 
     def verify_paths(self) -> VerifyReport:
         derived = self.derived_paths()
@@ -118,8 +250,90 @@ class AvdService:
 
     def list_avd_info(self, emulator_bin: str | None = None) -> tuple[int, list[AvdInfo], str]:
         code, avds, output = self.list_avds(emulator_bin=emulator_bin)
-        info = [AvdInfo(name=avd, status=self.avd_status(avd), config_path=self.avd_config_path(avd)) for avd in avds]
+        running_avds = self.running_avd_names()
+        info = []
+        for avd in avds:
+            config_path = self.avd_config_path(avd)
+            metadata = self.read_avd_metadata(config_path) if config_path else {}
+            is_running = avd in running_avds
+            info.append(
+                AvdInfo(
+                    name=avd,
+                    status="Running" if is_running else self.avd_status(avd),
+                    config_path=config_path,
+                    is_running=is_running,
+                    ram_mb=metadata.get("hw.ramSize"),
+                    heap_mb=metadata.get("vm.heapSize"),
+                    data_partition=metadata.get("disk.dataPartition.size"),
+                    image_label=metadata.get("image_label"),
+                    device_name=metadata.get("hw.device.name"),
+                )
+            )
         return code, info, output
+
+    def _run_quiet(self, cmd: list[str]) -> tuple[int, str]:
+        try:
+            proc = subprocess.run(
+                cmd,
+                env=self.runner.build_env(),
+                capture_output=True,
+                text=True,
+                check=False,
+                shell=False,
+            )
+            return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
+        except Exception:
+            return 1, ""
+
+    def running_avd_names(self, adb_bin: str | None = None) -> set[str]:
+        adb_bin = (adb_bin or self.derived_paths()["adb"]).strip()
+        code, output = self._run_quiet([adb_bin, "devices"])
+        if code != 0:
+            return set()
+
+        running: set[str] = set()
+        serials: list[str] = []
+        for raw_line in output.splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("List of devices attached"):
+                continue
+            parts = line.split()
+            if len(parts) >= 2 and parts[0].startswith("emulator-") and parts[1] == "device":
+                serials.append(parts[0])
+
+        for serial in serials:
+            code, avd_output = self._run_quiet([adb_bin, "-s", serial, "emu", "avd", "name"])
+            if code != 0:
+                continue
+            avd_name = avd_output.strip()
+            if avd_name:
+                running.add(avd_name)
+        return running
+
+    def read_avd_metadata(self, config_path: Path) -> dict[str, str]:
+        config = self.read_kv_file(config_path)
+        metadata = {
+            "hw.ramSize": self._normalize_mb_value(config.get("hw.ramSize"), "2048"),
+            "vm.heapSize": self._normalize_mb_value(config.get("vm.heapSize"), "256"),
+            "disk.dataPartition.size": self._normalize_partition_value(config.get("disk.dataPartition.size"), "2G"),
+            "hw.device.name": config.get("hw.device.name", "").strip() or config.get("hw.device", "").strip(),
+            "image_label": self._format_image_label(config),
+        }
+        return metadata
+
+    @staticmethod
+    def _format_image_label(config: dict[str, str]) -> str:
+        image_sysdir = config.get("image.sysdir.1", "").strip().strip("/")
+        if image_sysdir:
+            parts = [part for part in Path(image_sysdir).parts if part and part != "system-images"]
+            if parts:
+                return " · ".join(parts)
+
+        tag = config.get("tag.id", "").strip()
+        abi = config.get("abi.type", "").strip()
+        if tag and abi:
+            return f"{tag} · {abi}"
+        return tag or abi or "Imagen no detectada"
 
     def read_kv_file(self, path: Path) -> dict[str, str]:
         data: dict[str, str] = {}
@@ -159,6 +373,83 @@ class AvdService:
             return None, {}
         return config_path, self.read_kv_file(config_path)
 
+    @staticmethod
+    def _normalize_mb_value(value: str | None, default: str) -> str:
+        raw = (value or "").strip()
+        if not raw:
+            return default
+
+        match = re.fullmatch(r"(\d+)\s*(?:m|mb)?", raw, re.IGNORECASE)
+        if match:
+            return match.group(1)
+
+        digits = re.search(r"(\d+)", raw)
+        if digits:
+            return digits.group(1)
+        return default
+
+    @staticmethod
+    def _normalize_partition_value(value: str | None, default: str) -> str:
+        raw = (value or "").strip().upper()
+        if not raw:
+            return default
+
+        if re.fullmatch(r"\d+[MG]", raw, re.IGNORECASE):
+            return raw
+
+        if raw.isdigit():
+            bytes_value = int(raw)
+            gib = 1024 ** 3
+            mib = 1024 ** 2
+            if bytes_value >= gib and bytes_value % gib == 0:
+                return f"{bytes_value // gib}G"
+            if bytes_value >= mib and bytes_value % mib == 0:
+                return f"{bytes_value // mib}M"
+        return default
+
+    @staticmethod
+    def _normalize_frame_value(value: str | None, default: str = "yes") -> str:
+        raw = (value or "").strip().lower()
+        return raw if raw in {"yes", "no"} else default
+
+    def get_editable_avd_config(self, avd_name: str) -> tuple[Path | None, dict[str, str]]:
+        config_path, config = self.get_avd_config(avd_name)
+        if not config_path:
+            return None, {}
+
+        return config_path, {
+            "hw.ramSize": self._normalize_mb_value(config.get("hw.ramSize"), "2048"),
+            "vm.heapSize": self._normalize_mb_value(config.get("vm.heapSize"), "256"),
+            "disk.dataPartition.size": self._normalize_partition_value(config.get("disk.dataPartition.size"), "2G"),
+            "showDeviceFrame": self._normalize_frame_value(config.get("showDeviceFrame"), "yes"),
+        }
+
+    def normalize_avd_config_inputs(
+        self,
+        ram_mb: str,
+        heap_mb: str,
+        data_partition: str,
+        show_device_frame: str,
+    ) -> tuple[bool, dict[str, str] | None, str]:
+        ram = ram_mb.strip()
+        heap = heap_mb.strip()
+        partition = data_partition.strip().upper()
+        frame = show_device_frame.strip().lower()
+
+        if not ram.isdigit() or not heap.isdigit():
+            return False, None, "RAM y VM Heap deben ser enteros."
+        if not re.fullmatch(r"\d+[MG]", partition, re.IGNORECASE):
+            return False, None, "Data partition debe verse como 2G o 512M."
+        if frame not in {"yes", "no"}:
+            return False, None, "Show device frame debe ser yes o no."
+
+        return True, {
+            "hw.ramSize": ram,
+            "vm.heapSize": heap,
+            "disk.dataPartition.size": partition,
+            "showDeviceFrame": frame,
+        }, ""
+
     def update_avd_config(
         self,
         avd_name: str,
@@ -171,23 +462,18 @@ class AvdService:
         if not config_path:
             return False, f"No se encontró config.ini para {avd_name}."
 
-        if not ram_mb.isdigit() or not heap_mb.isdigit():
-            return False, "RAM y VM Heap deben ser enteros."
-        if not re.fullmatch(r"\d+[MG]", data_partition, re.IGNORECASE):
-            return False, "Data partition debe verse como 2G o 512M."
-
-        frame = show_device_frame.strip().lower()
-        if frame not in {"yes", "no"}:
-            return False, "Show device frame debe ser yes o no."
+        ok, updates, message = self.normalize_avd_config_inputs(
+            ram_mb=ram_mb,
+            heap_mb=heap_mb,
+            data_partition=data_partition,
+            show_device_frame=show_device_frame,
+        )
+        if not ok or updates is None:
+            return False, message
 
         self.write_kv_file(
             config_path,
-            {
-                "hw.ramSize": ram_mb.strip(),
-                "vm.heapSize": heap_mb.strip(),
-                "disk.dataPartition.size": data_partition.strip().upper(),
-                "showDeviceFrame": frame,
-            },
+            updates,
         )
         self.runner.output_queue.put(f"[edit-avd] Configuración actualizada en {config_path}\n")
         return True, "Configuración actualizada."

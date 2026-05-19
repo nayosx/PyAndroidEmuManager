@@ -1,6 +1,6 @@
 # PyAndroidEmuManager
 
-Administrador gráfico de Android Virtual Devices (AVD) construido en Python usando Tkinter.
+Administrador gráfico de Android Virtual Devices (AVD) construido en Python.
 
 Permite:
 
@@ -10,6 +10,23 @@ Permite:
 - visualizar logs en tiempo real
 - crear nuevos AVDs usando `avdmanager`
 - trabajar en macOS, Linux y Windows
+
+---
+
+# Versiones disponibles
+
+El proyecto cuenta con dos aplicaciones que comparten el mismo código base de servicios y lógica:
+
+| Versión | Archivo | Framework UI | Descripción |
+|---------|---------|--------------|-------------|
+| Tkinter | `py-avd.py` | Tkinter | Interfaz nativa del sistema operativo |
+| Flet | `flet_avd.py` | Flet | Interfaz moderna estilo web |
+
+Ambas versiones ofrecen la misma funcionalidad. La lógica compartida se encuentra en:
+
+- `services/` — detección de SDK, manejo de AVDs
+- `widgets/` — componentes de UI reutilizables (versión Flet)
+- `dialogs/` — diálogos de la aplicación (versión Flet)
 
 ---
 
@@ -49,7 +66,7 @@ xcode-select --install
 ### Python
 
 - Python 3.x
-- Tkinter funcional
+- Tkinter funcional (versión Tkinter)
 - entorno virtual recomendado
 
 Verificar Tkinter:
@@ -71,26 +88,53 @@ python3 -m venv .venv
 source .venv/bin/activate
 ```
 
-## Instalar dependencias
+---
+
+# Compilar versión Tkinter (`py-avd.py`)
+
+## Instalar dependencia
 
 ```bash
 pip install pyinstaller
 ```
 
----
-
-# Compilar aplicación
+## Compilar
 
 ```bash
 pyinstaller --clean --windowed --icon app.icns --name "Py Android Emu Manager" py-avd.py
 ```
 
----
-
-# Resultado
+## Resultado
 
 ```text
 dist/Py Android Emu Manager.app
+```
+
+---
+
+# Compilar versión Flet (`flet_avd.py`)
+
+## Instalar dependencias
+
+```bash
+pip install flet
+```
+
+## Compilar
+
+```bash
+flet pack flet_avd.py \
+  --name "Py Android Emu Manager Flet" \
+  --icon android.icns \
+  --add-data "mobile.png:."
+```
+
+> `--add-data "mobile.png:."` incluye la imagen usada en la UI dentro del bundle.
+
+## Resultado
+
+```text
+dist/Py Android Emu Manager Flet.app
 ```
 
 ---
@@ -101,15 +145,15 @@ Firmar localmente la app usando ad-hoc signing:
 
 ```bash
 codesign --force --deep --sign - \
-  "dist/Py Android Emu Manager.app"
+  "dist/Py Android Emu Manager Flet.app"
 ```
 
 Luego comprimir:
 
 ```bash
 ditto -c -k --keepParent \
-  "dist/Py Android Emu Manager.app" \
-  "PyAndroidEmuManager.zip"
+  "dist/Py Android Emu Manager Flet.app" \
+  "PyAndroidEmuManagerFlet.zip"
 ```
 
 ---
@@ -121,13 +165,13 @@ Esta app no está notarizada por Apple.
 Si macOS bloquea la apertura, ejecutar:
 
 ```bash
-xattr -dr com.apple.quarantine "Py Android Emu Manager.app"
+xattr -dr com.apple.quarantine "dist/Py Android Emu Manager Flet.app"
 ```
 
 Luego abrir:
 
 ```bash
-open "Py Android Emu Manager.app"
+open "dist/Py Android Emu Manager Flet.app"
 ```
 
 ---
@@ -148,16 +192,21 @@ python3 -m venv .venv
 source .venv/bin/activate
 ```
 
-## Instalar PyInstaller
+## Versión Tkinter
 
 ```bash
 pip install pyinstaller
+pyinstaller --clean --windowed --name "Py Android Emu Manager" py-avd.py
 ```
 
-## Compilar
+## Versión Flet
 
 ```bash
-pyinstaller --clean --windowed --name "Py Android Emu Manager" py-avd.py
+pip install flet
+flet pack flet_avd.py \
+  --name "Py Android Emu Manager Flet" \
+  --icon android.icns \
+  --add-data "mobile.png:."
 ```
 
 ---
@@ -182,23 +231,28 @@ py -m venv .venv
 .venv\Scripts\activate
 ```
 
-## Instalar PyInstaller
+## Versión Tkinter
 
 ```bash
 pip install pyinstaller
+pyinstaller --clean --windowed --name "Py Android Emu Manager" py-avd.py
 ```
 
-## Compilar
+## Versión Flet
 
 ```bash
-pyinstaller --clean --windowed --name "Py Android Emu Manager" py-avd.py
+pip install flet
+flet pack flet_avd.py \
+  --name "Py Android Emu Manager Flet" \
+  --icon android.icns \
+  --add-data "mobile.png:."
 ```
 
 ---
 
 # Nota importante
 
-La aplicación debe compilarse en el sistema operativo de destino.
+Cada versión debe compilarse en el sistema operativo de destino.
 
 Ejemplo:
 
@@ -206,13 +260,15 @@ Ejemplo:
 - Linux → compilar en Linux
 - Windows → compilar en Windows
 
-PyInstaller no realiza cross-compilation entre plataformas.
+PyInstaller y Flet no realizan cross-compilation entre plataformas.
 
 ---
 
 # Dependencias Python
 
-Actualmente el proyecto utiliza únicamente librerías estándar de Python:
+## Versión Tkinter (`py-avd.py`)
+
+Utiliza únicamente librerías estándar:
 
 - tkinter
 - subprocess
@@ -222,8 +278,16 @@ Actualmente el proyecto utiliza únicamente librerías estándar de Python:
 - platform
 - os
 
-Dependencia externa requerida:
+Dependencia externa:
 
 ```text
 pyinstaller
+```
+
+## Versión Flet (`flet_avd.py`)
+
+Dependencias externas:
+
+```text
+flet
 ```

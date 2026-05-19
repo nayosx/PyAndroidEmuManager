@@ -10,12 +10,19 @@ from pathlib import Path
 
 import flet as ft
 
-from services.avd_service import AvdInfo, AvdService, DeviceInfo
+from dialogs import open_create_dialog as show_create_dialog
+from dialogs import open_edit_dialog as show_edit_dialog
+from services.avd_service import AvdInfo, AvdService, DeviceInfo, EnvironmentStatus, BinaryStatus
+from services.config_store import ConfigStore
 from services.process_runner import ProcessRunner
 from services.sdk_paths import AndroidSdkPaths
+from views import build_dashboard_view
 
 
 BASE_DIR = Path(__file__).resolve().parent
+CONFIG_PATH = BASE_DIR / ".avd-manager.json"
+CACHE_TTL_SECONDS = 600
+AVD_LIST_CACHE_TTL_SECONDS = 5
 
 
 def border_all(width: float, color: str) -> ft.Border:
@@ -26,29 +33,72 @@ def border_all(width: float, color: str) -> ft.Border:
 class FletAvdApp:
     def __init__(self, page: ft.Page) -> None:
         self.page = page
+        self.config_store = ConfigStore(CONFIG_PATH)
+        self.config = self.config_store.load()
         self.log_queue: queue.Queue[str] = queue.Queue()
-        self.runner = ProcessRunner(AndroidSdkPaths.default_sdk_root(), self.log_queue)
+        initial_sdk_root = self.config.get("sdk_root", AndroidSdkPaths.default_sdk_root())
+        self.runner = ProcessRunner(initial_sdk_root, self.log_queue)
         self.avd_service = AvdService(self.runner)
 
         self.avd_items: list[AvdInfo] = []
         self.emulator_process: subprocess.Popen | None = None
-        self.log_lines: list[str] = []
-        self.log_expanded = False
+        self.log_expanded = bool(self.config.get("log_expanded", False))
         self.active_dialog: ft.AlertDialog | None = None
         self.refresh_target_name: str | None = None
         self.refresh_attempts_left = 0
         self.next_refresh_at = 0.0
         self.deleting_avd_names: set[str] = set()
         self.create_dialog_state: dict[str, object] | None = None
+        self.env_status: EnvironmentStatus | None = None
+        self.boot_status = "checking"
+        self.last_validation_signature: tuple[str, str, str, str] | None = None
+        self.last_validation_deep = False
+        self.images_cache: dict[tuple[str, str], list[str]] = {}
+        self.devices_cache: dict[tuple[str, str], list[DeviceInfo]] = {}
+        self.images_cache_time: dict[tuple[str, str], float] = {}
+        self.devices_cache_time: dict[tuple[str, str], float] = {}
+        self.avd_list_cache: dict[tuple[str, str], list[AvdInfo]] = {}
+        self.avd_list_cache_time: dict[tuple[str, str], float] = {}
+        self.log_entries: list[dict[str, str]] = []
 
         self.sdk_root_field = ft.TextField(
-            value=self.runner.sdk_root,
+            value=self.config.get("sdk_root", self.runner.sdk_root),
             border_radius=14,
             border_color="#304055",
             bgcolor="#151b24",
             color="#f5f7fb",
             text_size=14,
             expand=True,
+        )
+        self.emulator_path_field = ft.TextField(label="Ruta emulator", value=self.config.get("emulator_path", ""), border_radius=14, border_color="#304055", bgcolor="#151b24", color="#f5f7fb")
+        self.avdmanager_path_field = ft.TextField(label="Ruta avdmanager", value=self.config.get("avdmanager_path", ""), border_radius=14, border_color="#304055", bgcolor="#151b24", color="#f5f7fb")
+        self.sdkmanager_path_field = ft.TextField(label="Ruta sdkmanager", value=self.config.get("sdkmanager_path", ""), border_radius=14, border_color="#304055", bgcolor="#151b24", color="#f5f7fb")
+        self.log_filter = ft.Dropdown(
+            value="all",
+            width=160,
+            options=[
+                ft.dropdown.Option("all", "Todos"),
+                ft.dropdown.Option("create", "Create"),
+                ft.dropdown.Option("delete", "Delete"),
+                ft.dropdown.Option("launch", "Launch"),
+                ft.dropdown.Option("system", "System"),
+            ],
+            on_select=self._on_log_filter_change,
+            border_radius=12,
+            border_color="#253141",
+            bgcolor="#0e131a",
+            color="#dbe8ff",
+            text_size=12,
+        )
+        self.clear_log_button = ft.OutlinedButton(
+            "Limpiar log",
+            icon=ft.Icons.DELETE_SWEEP_ROUNDED,
+            on_click=self.clear_log,
+            style=ft.ButtonStyle(
+                color="#dbe8ff",
+                side=ft.BorderSide(1, "#344255"),
+                shape=ft.RoundedRectangleBorder(radius=12),
+            ),
         )
         self.log_view = ft.TextField(
             value="",
@@ -63,10 +113,41 @@ class FletAvdApp:
             text_style=ft.TextStyle(font_family="Courier New", size=12),
             expand=True,
         )
-        self.log_body = ft.Container(content=self.log_view, visible=False, expand=True)
-        self.log_header_icon = ft.Icon(ft.Icons.KEYBOARD_ARROW_UP_ROUNDED, color="#a8bbd9")
-        self.log_header_label = ft.Text("Log minimizado", color="#dbe8ff", weight=ft.FontWeight.W_600)
+        self.log_body = ft.Container(content=self.log_view, visible=self.log_expanded, expand=True)
+        self.log_header_icon = ft.Icon(
+            ft.Icons.KEYBOARD_ARROW_DOWN_ROUNDED if self.log_expanded else ft.Icons.KEYBOARD_ARROW_UP_ROUNDED,
+            color="#a8bbd9",
+        )
+        self.log_header_label = ft.Text(
+            "Log expandido" if self.log_expanded else "Log minimizado",
+            color="#dbe8ff",
+            weight=ft.FontWeight.W_600,
+        )
         self.cards_column = ft.Column(spacing=14, scroll=ft.ScrollMode.AUTO, expand=True)
+        self.banner_text = ft.Text("", color="#dbe8ff", size=13)
+        self.body_container = ft.Container(expand=True)
+        self.configs_button = ft.FilledButton(
+            "Configs",
+            icon=ft.Icons.SETTINGS_ROUNDED,
+            on_click=self.open_configs_dialog,
+            style=ft.ButtonStyle(
+                bgcolor="#192230",
+                color="#eff4fd",
+                padding=18,
+                shape=ft.RoundedRectangleBorder(radius=14),
+            ),
+        )
+        self.create_avd_button = ft.FilledButton(
+            "Crear nuevo AVD",
+            icon=ft.Icons.ADD_ROUNDED,
+            on_click=self.open_create_dialog,
+            style=ft.ButtonStyle(
+                bgcolor="#3478f6",
+                color="#ffffff",
+                padding=18,
+                shape=ft.RoundedRectangleBorder(radius=14),
+            ),
+        )
 
         self.page.title = "Android Emulator Manager Flet"
         self.page.theme_mode = ft.ThemeMode.DARK
@@ -75,6 +156,11 @@ class FletAvdApp:
         self.page.window_min_width = 1120
         self.page.window_min_height = 760
         self.page.on_keyboard_event = self._on_keyboard_event
+        self.sdk_root_field.on_change = self._on_path_fields_changed
+        self.emulator_path_field.on_change = self._on_path_fields_changed
+        self.avdmanager_path_field.on_change = self._on_path_fields_changed
+        self.sdkmanager_path_field.on_change = self._on_path_fields_changed
+        self._load_persisted_caches()
 
         self.page.add(self._build_layout())
         self.page.run_task(self._log_pump)
@@ -85,14 +171,7 @@ class FletAvdApp:
             controls=[
                 self._build_header(),
                 ft.Container(height=14),
-                ft.Container(
-                    content=self.cards_column,
-                    expand=True,
-                    border_radius=24,
-                    bgcolor="#101721",
-                    border=border_all(1, "#223041"),
-                    padding=18,
-                ),
+                self.body_container,
                 ft.Container(height=14),
                 self._build_log_panel(),
             ],
@@ -116,28 +195,8 @@ class FletAvdApp:
                     ft.Row(
                         controls=[
                             title_block,
-                            ft.FilledButton(
-                                "Configs",
-                                icon=ft.Icons.SETTINGS_ROUNDED,
-                                on_click=self.open_configs_dialog,
-                                style=ft.ButtonStyle(
-                                    bgcolor="#192230",
-                                    color="#eff4fd",
-                                    padding=18,
-                                    shape=ft.RoundedRectangleBorder(radius=14),
-                                ),
-                            ),
-                            ft.FilledButton(
-                                "Crear nuevo AVD",
-                                icon=ft.Icons.ADD_ROUNDED,
-                                on_click=self.open_create_dialog,
-                                style=ft.ButtonStyle(
-                                    bgcolor="#3478f6",
-                                    color="#ffffff",
-                                    padding=18,
-                                    shape=ft.RoundedRectangleBorder(radius=14),
-                                ),
-                            ),
+                            self.configs_button,
+                            self.create_avd_button,
                         ],
                         alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
                     ),
@@ -148,7 +207,7 @@ class FletAvdApp:
                             ft.IconButton(
                                 icon=ft.Icons.REFRESH_ROUNDED,
                                 tooltip="Recalcular rutas y refrescar AVDs",
-                                on_click=lambda _e: self.refresh_all(),
+                                on_click=lambda _e: self.refresh_all(deep_validate=True),
                                 style=ft.ButtonStyle(bgcolor="#192230", color="#eff4fd"),
                             ),
                         ],
@@ -163,6 +222,17 @@ class FletAvdApp:
         )
 
     def _build_log_panel(self) -> ft.Control:
+        self.log_toolbar = ft.Container(
+            content=ft.Row(
+                controls=[
+                    self.log_filter,
+                    self.clear_log_button,
+                ],
+                alignment=ft.MainAxisAlignment.END,
+            ),
+            visible=self.log_expanded,
+            padding=ft.Padding(left=8, top=4, right=8, bottom=8),
+        )
         self.log_panel = ft.Container(
             content=ft.Column(
                 controls=[
@@ -182,12 +252,13 @@ class FletAvdApp:
                             color="#dbe8ff",
                         ),
                     ),
+                    self.log_toolbar,
                     self.log_body,
                 ],
                 spacing=0,
                 expand=True,
             ),
-            height=68,
+            height=360 if self.log_expanded else 68,
             animate=ft.Animation(240, ft.AnimationCurve.EASE_OUT),
             bgcolor="#101721",
             border_radius=24,
@@ -199,130 +270,294 @@ class FletAvdApp:
     def set_sdk_root(self) -> None:
         self.runner.set_sdk_root(self.sdk_root_field.value.strip())
 
-    def refresh_all(self) -> None:
+    def _on_path_fields_changed(self, _event=None) -> None:
+        self.last_validation_signature = None
+        self.invalidate_avd_cache()
+
+    def _images_cache_key(self) -> tuple[str, str]:
+        return (self.sdk_root_field.value.strip(), self.sdkmanager_path_field.value.strip())
+
+    def _devices_cache_key(self) -> tuple[str, str]:
+        return (self.sdk_root_field.value.strip(), self.avdmanager_path_field.value.strip())
+
+    def _avd_list_cache_key(self) -> tuple[str, str]:
+        return (self.sdk_root_field.value.strip(), self.emulator_path_field.value.strip())
+
+    @staticmethod
+    def _format_loaded_at(timestamp: float | None) -> str:
+        if not timestamp:
+            return "Última carga: --"
+        return f"Última carga: {time.strftime('%H:%M:%S', time.localtime(timestamp))}"
+
+    def _load_persisted_caches(self) -> None:
+        now = time.time()
+
+        raw_images_cache = self.config.get("images_cache", {})
+        if isinstance(raw_images_cache, dict):
+            for cache_key, payload in raw_images_cache.items():
+                if not isinstance(payload, dict):
+                    continue
+                loaded_at = float(payload.get("loaded_at", 0) or 0)
+                items = payload.get("items", [])
+                if now - loaded_at > CACHE_TTL_SECONDS or not isinstance(items, list):
+                    continue
+                sdk_root, sdkmanager_path = cache_key.split("|", 1) if "|" in cache_key else (cache_key, "")
+                self.images_cache[(sdk_root, sdkmanager_path)] = [str(item) for item in items]
+                self.images_cache_time[(sdk_root, sdkmanager_path)] = loaded_at
+
+        raw_devices_cache = self.config.get("devices_cache", {})
+        if isinstance(raw_devices_cache, dict):
+            for cache_key, payload in raw_devices_cache.items():
+                if not isinstance(payload, dict):
+                    continue
+                loaded_at = float(payload.get("loaded_at", 0) or 0)
+                items = payload.get("items", [])
+                if now - loaded_at > CACHE_TTL_SECONDS or not isinstance(items, list):
+                    continue
+                sdk_root, avdmanager_path = cache_key.split("|", 1) if "|" in cache_key else (cache_key, "")
+                parsed: list[DeviceInfo] = []
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    parsed.append(
+                        DeviceInfo(
+                            device_id=str(item.get("device_id", "")),
+                            name=str(item.get("name", "")),
+                            oem=str(item.get("oem")) if item.get("oem") is not None else None,
+                            tag=str(item.get("tag")) if item.get("tag") is not None else None,
+                        )
+                    )
+                self.devices_cache[(sdk_root, avdmanager_path)] = parsed
+                self.devices_cache_time[(sdk_root, avdmanager_path)] = loaded_at
+
+    def invalidate_avd_cache(self) -> None:
+        self.avd_list_cache.clear()
+        self.avd_list_cache_time.clear()
+
+    def refresh_all(self, deep_validate: bool = False) -> None:
         self.set_sdk_root()
-        self.refresh_avds()
+        self.validate_environment(deep=deep_validate)
+        self.save_config()
+        if self.env_status and not self.env_status.needs_setup and self.env_status.can_list_avds:
+            self.refresh_avds(force_refresh=deep_validate)
+        self.update_header_actions()
+        self.render_body()
         self.page.update()
 
-    def refresh_avds(self) -> None:
+    def validate_environment(self, deep: bool = False) -> None:
+        signature = (
+            self.sdk_root_field.value.strip(),
+            self.emulator_path_field.value.strip(),
+            self.avdmanager_path_field.value.strip(),
+            self.sdkmanager_path_field.value.strip(),
+        )
+        if self.env_status is not None and signature == self.last_validation_signature and (self.last_validation_deep or not deep):
+            return
+
+        self.boot_status = "checking"
+        self.page.update()
+
+        sdk_root = self.sdk_root_field.value.strip()
+        emulator_path = self.emulator_path_field.value.strip() or None
+        avdmanager_path = self.avdmanager_path_field.value.strip() or None
+        sdkmanager_path = self.sdkmanager_path_field.value.strip() or None
+
+        self.env_status = self.avd_service.validate_environment(
+            sdk_root=sdk_root,
+            emulator_path=emulator_path,
+            avdmanager_path=avdmanager_path,
+            sdkmanager_path=sdkmanager_path,
+            deep=deep,
+        )
+        self.last_validation_signature = signature
+        self.last_validation_deep = deep
+
+        self.emulator_path_field.value = self.env_status.emulator.path
+        self.avdmanager_path_field.value = self.env_status.avdmanager.path
+        self.sdkmanager_path_field.value = self.env_status.sdkmanager.path
+
+        if self.env_status.is_ready:
+            self.boot_status = "ready"
+        elif self.env_status.needs_setup:
+            self.boot_status = "needs_setup"
+        else:
+            self.boot_status = "partial_ready"
+        self.save_config()
+
+    def update_header_actions(self) -> None:
+        self.configs_button.disabled = self.boot_status == "checking"
+        self.create_avd_button.disabled = not bool(self.env_status and self.env_status.can_create and not self.env_status.needs_setup)
+
+    def refresh_avds(self, force_refresh: bool = False) -> None:
+        if not self.env_status or not self.env_status.can_list_avds:
+            self.avd_items = []
+            return
         self.set_sdk_root()
-        code, avd_items, _output = self.avd_service.list_avd_info()
+        cache_key = self._avd_list_cache_key()
+        cache_time = self.avd_list_cache_time.get(cache_key, 0.0)
+        if not force_refresh and cache_key in self.avd_list_cache and (time.time() - cache_time) <= AVD_LIST_CACHE_TTL_SECONDS:
+            self.avd_items = self.avd_list_cache[cache_key]
+            self.render_body()
+            return
+
+        code, avd_items, _output = self.avd_service.list_avd_info(emulator_bin=self.emulator_path_field.value.strip())
         if code != 0:
             self.show_snackbar("No se pudieron listar los AVDs.", error=True)
             return
 
         self.avd_items = avd_items
-        self.cards_column.controls = [self.build_avd_card(item) for item in avd_items] or [self.build_empty_state()]
-        self.page.update()
+        self.avd_list_cache[cache_key] = avd_items
+        self.avd_list_cache_time[cache_key] = time.time()
+        self.render_body()
 
-    def build_empty_state(self) -> ft.Control:
+    def render_body(self) -> None:
+        if self.boot_status == "checking":
+            self.body_container.content = self.build_boot_state()
+            return
+
+        if self.env_status and self.env_status.needs_setup:
+            self.body_container.content = self.build_setup_state()
+            return
+
+        self.body_container.content = build_dashboard_view(self, border_all)
+
+    def build_boot_state(self) -> ft.Control:
         return ft.Container(
             content=ft.Column(
                 controls=[
-                    ft.Icon(ft.Icons.DEVICES_OTHER_OUTLINED, size=40, color="#6b809f"),
-                    ft.Text("No se encontraron AVDs", size=20, weight=ft.FontWeight.BOLD, color="#eef4ff"),
-                    ft.Text("Usa el botón Crear nuevo AVD o revisa las rutas en Configs.", color="#8ea2bf"),
+                    ft.ProgressRing(width=28, height=28, stroke_width=3, color="#4f8cff"),
+                    ft.Text("Detectando entorno Android SDK...", size=18, weight=ft.FontWeight.BOLD, color="#eef4ff"),
                 ],
-                spacing=10,
+                spacing=16,
                 horizontal_alignment=ft.CrossAxisAlignment.CENTER,
                 alignment=ft.MainAxisAlignment.CENTER,
             ),
+            expand=True,
             alignment=ft.Alignment(0, 0),
-            height=320,
+            bgcolor="#101721",
+            border_radius=24,
+            border=border_all(1, "#223041"),
         )
 
-    def build_avd_card(self, item: AvdInfo) -> ft.Control:
-        is_deleting = item.name in self.deleting_avd_names
+    def build_setup_state(self) -> ft.Control:
+        checks = []
+        if self.env_status:
+            checks = [
+                self.build_check_row(self.env_status.emulator),
+                self.build_check_row(self.env_status.avdmanager),
+                self.build_check_row(self.env_status.sdkmanager),
+            ]
+
         return ft.Container(
-            content=ft.Row(
+            content=ft.Column(
                 controls=[
-                    ft.Container(
-                        content=ft.Image(src="mobile.png", width=54, height=54, fit="contain"),
-                        width=76,
-                        height=76,
-                        alignment=ft.Alignment(0, 0),
-                        border_radius=20,
-                        bgcolor="#151d28",
-                    ),
-                    ft.Column(
-                        controls=[
-                            ft.Text(item.name, size=18, weight=ft.FontWeight.BOLD, color="#f5f8fe"),
-                            ft.Row(
-                                controls=[
-                                    ft.Icon(ft.Icons.CIRCLE, size=12, color="#41d391"),
-                                    ft.Text(item.status, color="#8fa4c2", size=13),
-                                ],
-                                spacing=8,
-                            ),
-                        ],
-                        spacing=8,
-                        expand=True,
-                    ),
+                    ft.Text("Configura tu Android SDK", size=24, weight=ft.FontWeight.BOLD, color="#eef4ff"),
+                    ft.Text("La app no mostrará AVDs ni permitirá crear nuevos hasta validar el entorno.", color="#8ea2bf"),
+                    self.sdk_root_field,
+                    self.emulator_path_field,
+                    self.avdmanager_path_field,
+                    self.sdkmanager_path_field,
                     ft.Row(
                         controls=[
-                            ft.FilledButton(
-                                "Lanzar",
-                                icon=ft.Icons.PLAY_ARROW_ROUNDED,
-                                on_click=lambda _e, avd=item.name: self.launch_avd(avd),
-                                disabled=is_deleting,
-                                style=ft.ButtonStyle(
-                                    bgcolor="#2bb673",
-                                    color="#ffffff",
-                                    padding=18,
-                                    shape=ft.RoundedRectangleBorder(radius=14),
-                                ),
-                            ),
-                            ft.OutlinedButton(
-                                "Editar",
-                                icon=ft.Icons.TUNE_ROUNDED,
-                                on_click=lambda _e, avd=item.name: self.open_edit_dialog(avd),
-                                disabled=is_deleting,
-                                style=ft.ButtonStyle(
-                                    color="#e7edf8",
-                                    side=ft.BorderSide(1, "#39485d"),
-                                    padding=18,
-                                    shape=ft.RoundedRectangleBorder(radius=14),
-                                ),
-                            ),
-                            (
-                                ft.FilledButton(
-                                    "Eliminar",
-                                    icon=ft.Icons.DELETE_OUTLINE_ROUNDED,
-                                    on_click=lambda _e, avd=item.name: self.confirm_delete(avd),
-                                    style=ft.ButtonStyle(
-                                        bgcolor="#cf4d4d",
-                                        color="#ffffff",
-                                        padding=18,
-                                        shape=ft.RoundedRectangleBorder(radius=14),
-                                    ),
-                                )
-                                if not is_deleting
-                                else ft.Container(
-                                    content=ft.Row(
-                                        controls=[
-                                            ft.ProgressRing(width=16, height=16, stroke_width=2, color="#ffffff"),
-                                            ft.Text("Eliminando...", color="#ffffff", size=13, weight=ft.FontWeight.W_600),
-                                        ],
-                                        spacing=10,
-                                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                                    ),
-                                    bgcolor="#7a3737",
-                                    border_radius=14,
-                                    padding=ft.Padding(left=16, top=12, right=16, bottom=12),
-                                )
-                            ),
+                            ft.FilledButton("Autodetectar", on_click=lambda _e: self.autodetect_paths(), icon=ft.Icons.AUTO_FIX_HIGH_ROUNDED),
+                            ft.OutlinedButton("Validar", on_click=lambda _e: self.refresh_all(deep_validate=True), icon=ft.Icons.CHECK_CIRCLE_OUTLINE_ROUNDED),
+                            ft.OutlinedButton("Restablecer configuración", on_click=lambda _e: self.reset_configuration(), icon=ft.Icons.RESTART_ALT_ROUNDED),
                         ],
-                        spacing=10,
+                        spacing=12,
+                    ),
+                    ft.Container(
+                        content=ft.Column(controls=checks, spacing=10),
+                        bgcolor="#151d28",
+                        border_radius=18,
+                        padding=16,
                     ),
                 ],
-                alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
-                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                spacing=18,
             ),
-            bgcolor="#151d28",
-            border_radius=22,
-            border=border_all(1, "#263448"),
-            padding=18,
+            expand=True,
+            bgcolor="#101721",
+            border_radius=24,
+            border=border_all(1, "#223041"),
+            padding=24,
         )
+
+    def build_check_row(self, status: BinaryStatus) -> ft.Control:
+        color = "#41d391" if status.usable else "#f0a54a" if status.exists else "#d86464"
+        label = "OK" if status.usable else status.detail
+        return ft.Row(
+            controls=[
+                ft.Icon(ft.Icons.CIRCLE, size=12, color=color),
+                ft.Text(f"{status.label}: {label}", color="#eef4ff", width=220),
+                ft.Text(status.path, color="#8ea2bf", selectable=True, expand=True),
+            ],
+            spacing=12,
+        )
+
+    def autodetect_paths(self) -> None:
+        self.sdk_root_field.value = AndroidSdkPaths.default_sdk_root()
+        self.emulator_path_field.value = ""
+        self.avdmanager_path_field.value = ""
+        self.sdkmanager_path_field.value = ""
+        self.last_validation_signature = None
+        self.images_cache.clear()
+        self.devices_cache.clear()
+        self.images_cache_time.clear()
+        self.devices_cache_time.clear()
+        self.invalidate_avd_cache()
+        self.refresh_all()
+
+    def reset_configuration(self) -> None:
+        self.config = {}
+        self.config_store.save({})
+        self.sdk_root_field.value = AndroidSdkPaths.default_sdk_root()
+        self.emulator_path_field.value = ""
+        self.avdmanager_path_field.value = ""
+        self.sdkmanager_path_field.value = ""
+        self.last_validation_signature = None
+        self.last_validation_deep = False
+        self.images_cache.clear()
+        self.devices_cache.clear()
+        self.images_cache_time.clear()
+        self.devices_cache_time.clear()
+        self.invalidate_avd_cache()
+        self.refresh_all()
+
+    def save_config(self) -> None:
+        serialized_images_cache: dict[str, dict[str, object]] = {}
+        for (sdk_root, sdkmanager_path), items in self.images_cache.items():
+            serialized_images_cache[f"{sdk_root}|{sdkmanager_path}"] = {
+                "loaded_at": self.images_cache_time.get((sdk_root, sdkmanager_path), 0),
+                "items": items,
+            }
+
+        serialized_devices_cache: dict[str, dict[str, object]] = {}
+        for (sdk_root, avdmanager_path), items in self.devices_cache.items():
+            serialized_devices_cache[f"{sdk_root}|{avdmanager_path}"] = {
+                "loaded_at": self.devices_cache_time.get((sdk_root, avdmanager_path), 0),
+                "items": [
+                    {
+                        "device_id": item.device_id,
+                        "name": item.name,
+                        "oem": item.oem,
+                        "tag": item.tag,
+                    }
+                    for item in items
+                ],
+            }
+
+        data = {
+            "sdk_root": self.sdk_root_field.value.strip(),
+            "emulator_path": self.emulator_path_field.value.strip(),
+            "avdmanager_path": self.avdmanager_path_field.value.strip(),
+            "sdkmanager_path": self.sdkmanager_path_field.value.strip(),
+            "last_image_package": self.config.get("last_image_package", ""),
+            "last_device_id": self.config.get("last_device_id", ""),
+            "images_cache": serialized_images_cache,
+            "devices_cache": serialized_devices_cache,
+            "log_expanded": self.log_expanded,
+        }
+        self.config = data
+        self.config_store.save(data)
 
     def show_dialog(self, dialog: ft.AlertDialog) -> None:
         self.active_dialog = dialog
@@ -341,7 +576,11 @@ class FletAvdApp:
 
     def open_configs_dialog(self, _event) -> None:
         self.set_sdk_root()
-        derived = self.avd_service.derived_paths()
+        derived = {
+            "emulator": self.emulator_path_field.value.strip(),
+            "avdmanager": self.avdmanager_path_field.value.strip(),
+            "sdkmanager": self.sdkmanager_path_field.value.strip(),
+        }
         dialog = ft.AlertDialog(
             modal=True,
             bgcolor="#111823",
@@ -380,245 +619,7 @@ class FletAvdApp:
         )
 
     def open_create_dialog(self, _event) -> None:
-        name_field = ft.TextField(label="Nombre", autofocus=True)
-        force_checkbox = ft.Checkbox(label="Sobrescribir si existe", value=False)
-        create_button = ft.FilledButton("Crear", disabled=True)
-        images_dropdown = ft.Dropdown(
-            label="Imágenes disponibles",
-            options=[],
-            hint_text="Cargando imágenes disponibles...",
-            disabled=True,
-        )
-        device_dropdown = ft.Dropdown(
-            label="Device disponible",
-            options=[],
-            hint_text="Cargando devices disponibles",
-            on_select=self._apply_selected_device,
-            disabled=True,
-        )
-        loading_text = ft.Text("", color="#dbe8ff", size=13)
-        loading_row = ft.Container(
-            content=ft.Row(
-                controls=[
-                    ft.ProgressRing(width=18, height=18, stroke_width=2, color="#4f8cff"),
-                    loading_text,
-                ],
-                spacing=10,
-                vertical_alignment=ft.CrossAxisAlignment.CENTER,
-            ),
-            visible=False,
-            bgcolor="#151d28",
-            border_radius=14,
-            padding=12,
-        )
-        status_text = ft.Text("", color="#ef9090")
-        images_total_text = ft.Text("Total imágenes: --", color="#8ea2bf", size=12)
-        devices_total_text = ft.Text("Total devices: --", color="#8ea2bf", size=12)
-        selected_package_text = ft.Text(
-            f"Package seleccionado: {self.avd_service.default_image_package()}",
-            color="#8ea2bf",
-            size=12,
-        )
-        create_progress = ft.Container(
-            content=ft.Row(
-                controls=[
-                    ft.ProgressRing(width=18, height=18, stroke_width=2, color="#4f8cff"),
-                    ft.Text("Creando AVD...", color="#dbe8ff", size=13, weight=ft.FontWeight.W_600),
-                ],
-                spacing=10,
-                vertical_alignment=ft.CrossAxisAlignment.CENTER,
-            ),
-            visible=False,
-            bgcolor="#151d28",
-            border_radius=14,
-            padding=12,
-        )
-        loading_counter = {"count": 0}
-        creating_state = {"active": False}
-
-        def refresh_create_enabled(_event=None) -> None:
-            can_create = (
-                bool(name_field.value.strip())
-                and bool((images_dropdown.value or "").strip())
-                and bool((device_dropdown.value or "").strip())
-                and not creating_state["active"]
-            )
-            create_button.disabled = not can_create
-            self.page.update()
-
-        name_field.on_change = refresh_create_enabled
-
-        def apply_selected_image(_event: ft.ControlEvent) -> None:
-            selected = images_dropdown.value
-            if selected:
-                selected_package_text.value = f"Package seleccionado: {selected}"
-                self.page.update()
-
-        images_dropdown.on_select = apply_selected_image
-
-        def set_create_in_progress(in_progress: bool, message: str = "") -> None:
-            creating_state["active"] = in_progress
-            name_field.disabled = in_progress
-            images_dropdown.disabled = in_progress or not bool(images_dropdown.options)
-            device_dropdown.disabled = in_progress or not bool(device_dropdown.options)
-            force_checkbox.disabled = in_progress
-            create_button.text = "Creando..." if in_progress else "Crear"
-            create_progress.visible = in_progress
-            status_text.value = message
-            refresh_create_enabled()
-            self.page.update()
-
-        def set_loading(message: str, visible: bool) -> None:
-            if visible:
-                loading_counter["count"] += 1
-                loading_text.value = message
-                loading_row.visible = True
-            else:
-                loading_counter["count"] = max(0, loading_counter["count"] - 1)
-                if loading_counter["count"] == 0:
-                    loading_text.value = ""
-                    loading_row.visible = False
-            self.page.update()
-
-        def apply_images_result(code: int, images: list[str]) -> None:
-            set_loading("", False)
-            if code != 0:
-                status_text.value = "No se pudieron listar las imágenes. Revisa el log."
-                self.page.update()
-                return
-            if not images:
-                status_text.value = "No se encontraron system images disponibles."
-                self.page.update()
-                return
-
-            images_dropdown.options = [ft.dropdown.Option(image) for image in images]
-            images_dropdown.value = self.avd_service.default_image_package() if self.avd_service.default_image_package() in images else images[0]
-            images_dropdown.disabled = False
-            images_dropdown.hint_text = "Selecciona una imagen"
-            images_total_text.value = f"Total imágenes: {len(images)}"
-            selected_package_text.value = f"Package seleccionado: {images_dropdown.value}"
-            status_text.value = ""
-            refresh_create_enabled()
-            self.page.update()
-
-        def load_images() -> tuple[int, list[str]]:
-            set_loading("Consultando imágenes disponibles...", True)
-            self.set_sdk_root()
-            code, images, _output = self.avd_service.list_available_images()
-            return code, images
-
-        def apply_devices_result(code: int, devices: list[DeviceInfo]) -> None:
-            set_loading("", False)
-            if code != 0:
-                status_text.value = "No se pudieron listar los devices. Revisa el log."
-                self.page.update()
-                return
-            if not devices:
-                status_text.value = "No se encontraron devices disponibles."
-                self.page.update()
-                return
-
-            device_dropdown.options = [ft.dropdown.Option(device.device_id, self._device_option_label(device)) for device in devices]
-            default_device = self.avd_service.default_device_id()
-            selected_device = default_device if any(device.device_id == default_device for device in devices) else devices[0].device_id
-            device_dropdown.value = selected_device
-            device_dropdown.disabled = False
-            device_dropdown.hint_text = "Selecciona un device"
-            devices_total_text.value = f"Total devices: {len(devices)}"
-            status_text.value = ""
-            refresh_create_enabled()
-            self.page.update()
-
-        def load_devices() -> tuple[int, list[DeviceInfo]]:
-            set_loading("Consultando devices disponibles...", True)
-            self.set_sdk_root()
-            code, devices, _output = self.avd_service.list_available_devices()
-            return code, devices
-
-        def submit(_e) -> None:
-            name = name_field.value.strip()
-            package = (images_dropdown.value or "").strip()
-            device = (device_dropdown.value or "").strip()
-            if not name or not package or not device:
-                status_text.value = "Completa nombre, package y device."
-                self.page.update()
-                return
-
-            self.set_sdk_root()
-            self.log_expanded = True
-            self.log_body.visible = True
-            self.log_body.expand = True
-            self.log_header_label.value = "Log expandido"
-            self.log_header_icon.name = ft.Icons.KEYBOARD_ARROW_DOWN_ROUNDED
-            self.log_panel.height = 360
-            set_create_in_progress(True, "")
-            self.log_queue.put(f"[create-avd] Solicitud recibida para '{name}'\n")
-            self.log_queue.put(f"[create-avd] package={package}\n")
-            self.log_queue.put(f"[create-avd] device={device} force={bool(force_checkbox.value)}\n")
-
-            def on_exit(code: int) -> None:
-                if code == 0:
-                    self.log_queue.put("[create-avd] AVD creado correctamente.\n")
-                    self.log_queue.put(f"__REFRESH_AVDS__:{name}\n")
-                    self.log_queue.put(f"__CREATE_RESULT__:{name}:{code}\n")
-                else:
-                    self.log_queue.put("[create-avd] Falló la creación del AVD.\n")
-                    self.log_queue.put(f"__CREATE_RESULT__:{name}:{code}\n")
-
-            proc = self.avd_service.create_avd(
-                name=name,
-                package=package,
-                device=device,
-                force=bool(force_checkbox.value),
-                on_exit=on_exit,
-            )
-            if proc is None:
-                set_create_in_progress(False, "No se pudo iniciar el proceso.")
-                return
-
-            self.show_snackbar(f"Creando AVD {name}...")
-            self.create_dialog_state = {
-                "dialog": dialog,
-                "set_create_in_progress": set_create_in_progress,
-            }
-
-        dialog = ft.AlertDialog(
-            modal=True,
-            bgcolor="#111823",
-            title=ft.Text("Crear nuevo AVD", color="#eff4fd", weight=ft.FontWeight.BOLD),
-            content=ft.Container(
-                width=640,
-                content=ft.Column(
-                    controls=[
-                        name_field,
-                        ft.Column(controls=[images_total_text, images_dropdown, selected_package_text], spacing=8),
-                        ft.Column(controls=[devices_total_text, device_dropdown], spacing=8),
-                        loading_row,
-                        create_progress,
-                        force_checkbox,
-                        status_text,
-                    ],
-                    tight=True,
-                    spacing=18,
-                ),
-            ),
-            actions=[
-                ft.TextButton("Cancelar", on_click=lambda _e: self.close_dialog(dialog)),
-                create_button,
-            ],
-            actions_alignment=ft.MainAxisAlignment.END,
-        )
-        create_button.on_click = submit
-        self.show_dialog(dialog)
-
-        async def bootstrap_options() -> None:
-            await asyncio.sleep(0.05)
-            code, images = await asyncio.to_thread(load_images)
-            apply_images_result(code, images)
-            code, devices = await asyncio.to_thread(load_devices)
-            apply_devices_result(code, devices)
-
-        self.page.run_task(bootstrap_options)
+        show_create_dialog(self, _event)
 
     def _device_option_label(self, device: DeviceInfo) -> str:
         parts = [device.name, f"({device.device_id})"]
@@ -627,84 +628,32 @@ class FletAvdApp:
         return " ".join(parts)
 
     def _apply_selected_device(self, _event: ft.ControlEvent) -> None:
+        if _event.control.value:
+            self.config["last_device_id"] = _event.control.value
+            self.save_config()
         self.page.update()
 
     def open_edit_dialog(self, avd_name: str) -> None:
-        config_path, config = self.avd_service.get_avd_config(avd_name)
-        if not config_path:
-            self.show_snackbar(f"No se encontró config.ini para {avd_name}.", error=True)
-            return
-
-        ram_field = ft.TextField(label="RAM (MB)", value=config.get("hw.ramSize", "2048"))
-        heap_field = ft.TextField(label="VM Heap (MB)", value=config.get("vm.heapSize", "256"))
-        partition_field = ft.TextField(label="Data partition", value=config.get("disk.dataPartition.size", "2G"))
-        frame_dropdown = ft.Dropdown(
-            label="Show device frame",
-            value=config.get("showDeviceFrame", "yes"),
-            options=[ft.dropdown.Option("yes"), ft.dropdown.Option("no")],
-        )
-        status_text = ft.Text("", color="#ef9090")
-
-        def save(_e) -> None:
-            ok, message = self.avd_service.update_avd_config(
-                avd_name=avd_name,
-                ram_mb=ram_field.value.strip(),
-                heap_mb=heap_field.value.strip(),
-                data_partition=partition_field.value.strip(),
-                show_device_frame=frame_dropdown.value or "yes",
-            )
-            if not ok:
-                status_text.value = message
-                self.page.update()
-                return
-
-            self.close_dialog(dialog)
-            self.refresh_avds()
-            self.show_snackbar(message)
-
-        dialog = ft.AlertDialog(
-            modal=True,
-            bgcolor="#111823",
-            title=ft.Text(f"Editar {avd_name}", color="#eff4fd", weight=ft.FontWeight.BOLD),
-            content=ft.Container(
-                width=600,
-                content=ft.Column(
-                    controls=[
-                        ft.Text(f"Archivo: {config_path}", color="#7c91b1", size=12, selectable=True),
-                        ram_field,
-                        heap_field,
-                        partition_field,
-                        frame_dropdown,
-                        status_text,
-                    ],
-                    tight=True,
-                    spacing=12,
-                ),
-            ),
-            actions=[
-                ft.TextButton("Cancelar", on_click=lambda _e: self.close_dialog(dialog)),
-                ft.FilledButton("Guardar", on_click=save),
-            ],
-            actions_alignment=ft.MainAxisAlignment.END,
-        )
-        self.show_dialog(dialog)
+        show_edit_dialog(self, avd_name)
 
     def confirm_delete(self, avd_name: str) -> None:
         async def remove_async(avd_to_delete: str) -> None:
-            code, _output = await asyncio.to_thread(self.avd_service.delete_avd, avd_to_delete)
+            code, _output = await asyncio.to_thread(self.avd_service.delete_avd, avd_to_delete, self.avdmanager_path_field.value.strip())
             self.deleting_avd_names.discard(avd_to_delete)
+            self.invalidate_avd_cache()
             if code != 0:
-                self.refresh_avds()
+                self.refresh_avds(force_refresh=True)
                 self.show_snackbar(f"No se pudo eliminar {avd_to_delete}.", error=True)
                 return
-            self.refresh_avds()
+            self.refresh_avds(force_refresh=True)
             self.show_snackbar(f"{avd_to_delete} eliminado.")
 
         def remove(_e) -> None:
             self.close_dialog(dialog)
             self.set_sdk_root()
             self.deleting_avd_names.add(avd_name)
-            self.refresh_avds()
+            self.invalidate_avd_cache()
+            self.refresh_avds(force_refresh=True)
             self.show_snackbar(f"Eliminando {avd_name}...")
 
             async def remove_task() -> None:
@@ -738,7 +687,7 @@ class FletAvdApp:
             return
 
         self.set_sdk_root()
-        proc = self.avd_service.launch_emulator(avd_name)
+        proc = self.avd_service.launch_emulator(avd_name, emulator_bin=self.emulator_path_field.value.strip())
         if proc is None:
             self.show_snackbar(f"No se pudo iniciar {avd_name}.", error=True)
             return
@@ -755,6 +704,33 @@ class FletAvdApp:
             ft.Icons.KEYBOARD_ARROW_DOWN_ROUNDED if self.log_expanded else ft.Icons.KEYBOARD_ARROW_UP_ROUNDED
         )
         self.log_panel.height = 360 if self.log_expanded else 68
+        self.log_toolbar.visible = self.log_expanded
+        self.save_config()
+        self.page.update()
+
+    def _detect_log_category(self, message: str) -> str:
+        if "[create-avd]" in message:
+            return "create"
+        if "[delete-avd:" in message:
+            return "delete"
+        if "[launch:" in message:
+            return "launch"
+        return "system"
+
+    def _apply_log_view(self) -> None:
+        filter_value = self.log_filter.value or "all"
+        visible_entries = self.log_entries
+        if filter_value != "all":
+            visible_entries = [entry for entry in self.log_entries if entry["category"] == filter_value]
+        self.log_view.value = "".join(entry["text"] for entry in visible_entries[-500:])
+
+    def clear_log(self, _event=None) -> None:
+        self.log_entries.clear()
+        self._apply_log_view()
+        self.page.update()
+
+    def _on_log_filter_change(self, _event=None) -> None:
+        self._apply_log_view()
         self.page.update()
 
     def show_snackbar(self, message: str, error: bool = False) -> None:
@@ -775,6 +751,7 @@ class FletAvdApp:
                         self.refresh_target_name = msg.split(":", 1)[1].strip()
                         self.refresh_attempts_left = 8
                         self.next_refresh_at = 0.0
+                        self.invalidate_avd_cache()
                         continue
                     if msg.startswith("__CREATE_RESULT__:"):
                         _prefix, avd_name, code_raw = msg.strip().split(":", 2)
@@ -791,17 +768,25 @@ class FletAvdApp:
                             elif code != 0:
                                 self.show_snackbar(f"Falló la creación de {avd_name}. Revisa el log.", error=True)
                         continue
-                    self.log_lines.append(msg)
+                    timestamp = time.strftime("%H:%M:%S", time.localtime())
+                    self.log_entries.append(
+                        {
+                            "category": self._detect_log_category(msg),
+                            "text": f"[{timestamp}] {msg}",
+                        }
+                    )
+                    if len(self.log_entries) > 1500:
+                        self.log_entries = self.log_entries[-1500:]
                     changed = True
                 except queue.Empty:
                     break
 
             if changed:
-                self.log_view.value = "".join(self.log_lines[-500:])
+                self._apply_log_view()
                 self.page.update()
 
             if self.refresh_target_name and self.refresh_attempts_left > 0 and time.monotonic() >= self.next_refresh_at:
-                self.refresh_avds()
+                self.refresh_avds(force_refresh=True)
                 avd_names = {item.name for item in self.avd_items}
                 if self.refresh_target_name in avd_names:
                     self.show_snackbar(f"{self.refresh_target_name} ya aparece en la lista.")
@@ -811,7 +796,7 @@ class FletAvdApp:
                     self.refresh_attempts_left -= 1
                     self.next_refresh_at = time.monotonic() + 1.0
 
-            await asyncio.sleep(0.2)
+            await asyncio.sleep(0.1 if changed or self.refresh_target_name else 0.5)
 
 
 def main(page: ft.Page) -> None:
