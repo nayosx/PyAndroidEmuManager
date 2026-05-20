@@ -49,6 +49,15 @@ class DeviceInfo:
 
 
 @dataclass
+class ImagePackageInfo:
+    package: str
+    installed: bool
+    updatable: bool = False
+    version: str | None = None
+    description: str | None = None
+
+
+@dataclass
 class BinaryStatus:
     label: str
     path: str
@@ -546,23 +555,154 @@ class AvdService:
         sdkmanager_bin = (sdkmanager_bin or self.derived_paths()["sdkmanager"]).strip()
         return self.runner.run_sync([sdkmanager_bin, "--list"], "sdkmanager-list")
 
-    def list_available_images(self, sdkmanager_bin: str | None = None) -> tuple[int, list[str], str]:
+    @staticmethod
+    def _parse_system_image_line(line: str) -> tuple[str, str | None, str | None] | None:
+        if not line:
+            return None
+        parts = [part.strip() for part in line.split("|")]
+        package = parts[0] if parts else ""
+        if not package.startswith("system-images;"):
+            return None
+        version = parts[1] if len(parts) > 1 and parts[1] else None
+        description = parts[2] if len(parts) > 2 and parts[2] else None
+        return package, version, description
+
+    def list_system_image_catalog(self, sdkmanager_bin: str | None = None) -> tuple[int, list[ImagePackageInfo], str]:
         code, output = self.list_images(sdkmanager_bin=sdkmanager_bin)
-        images: list[str] = []
-        seen: set[str] = set()
+        installed: dict[str, ImagePackageInfo] = {}
+        available: dict[str, ImagePackageInfo] = {}
+        updatable: set[str] = set()
+        section = ""
 
         for raw_line in output.splitlines():
             line = raw_line.strip()
-            if not line.startswith("system-images;"):
+            lowered = line.lower()
+            if lowered.startswith("installed packages:"):
+                section = "installed"
+                continue
+            if lowered.startswith("available packages:"):
+                section = "available"
+                continue
+            if lowered.startswith("available updates:"):
+                section = "updates"
+                continue
+            if not line or lowered.startswith("path") or set(line) == {"-"}:
                 continue
 
-            package = line.split("|", 1)[0].strip()
-            if package and package not in seen:
-                images.append(package)
-                seen.add(package)
+            parsed = self._parse_system_image_line(line)
+            if not parsed:
+                continue
+            package, version, description = parsed
+            if section == "installed":
+                installed[package] = ImagePackageInfo(
+                    package=package,
+                    installed=True,
+                    updatable=False,
+                    version=version,
+                    description=description,
+                )
+            elif section == "available":
+                available[package] = ImagePackageInfo(
+                    package=package,
+                    installed=False,
+                    updatable=False,
+                    version=version,
+                    description=description,
+                )
+            elif section == "updates":
+                updatable.add(package)
 
-        images.sort()
+        catalog: dict[str, ImagePackageInfo] = {}
+        all_packages = set(installed) | set(available) | set(updatable)
+        for package in all_packages:
+            base = installed.get(package) or available.get(package)
+            if base is None:
+                base = ImagePackageInfo(package=package, installed=False)
+            catalog[package] = ImagePackageInfo(
+                package=package,
+                installed=package in installed,
+                updatable=package in updatable,
+                version=base.version,
+                description=base.description,
+            )
+
+        items = sorted(catalog.values(), key=lambda item: item.package)
+        return code, items, output
+
+    def list_available_images(self, sdkmanager_bin: str | None = None) -> tuple[int, list[str], str]:
+        code, catalog, output = self.list_system_image_catalog(sdkmanager_bin=sdkmanager_bin)
+        images = sorted(item.package for item in catalog if item.installed)
         return code, images, output
+
+    def _run_sync_with_input(self, cmd: list[str], title: str, stdin_text: str | None = None) -> tuple[int, str]:
+        try:
+            self.runner.output_queue.put(f"\n[{title}] Ejecutando: {' '.join(cmd)}\n")
+            proc = subprocess.Popen(
+                cmd,
+                env=self.runner.build_env(),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL,
+                text=True,
+                bufsize=1,
+                shell=False,
+            )
+
+            if stdin_text is not None and proc.stdin:
+                proc.stdin.write(stdin_text)
+                proc.stdin.flush()
+                proc.stdin.close()
+
+            output_chunks: list[str] = []
+            current_line = ""
+            if proc.stdout:
+                while True:
+                    char = proc.stdout.read(1)
+                    if char == "":
+                        break
+                    output_chunks.append(char)
+                    if char in ("\n", "\r"):
+                        if current_line:
+                            self.runner.output_queue.put(current_line + "\n")
+                            current_line = ""
+                    else:
+                        current_line += char
+                if current_line:
+                    self.runner.output_queue.put(current_line + "\n")
+                proc.stdout.close()
+
+            code = proc.wait()
+            output = "".join(output_chunks)
+            self.runner.output_queue.put(f"[{title}] exit={code}\n")
+            return code, output
+        except Exception as exc:
+            msg = f"[{title}] error: {exc}\n"
+            self.runner.output_queue.put(msg)
+            return 1, msg
+
+    def install_system_image(
+        self,
+        package: str,
+        sdkmanager_bin: str | None = None,
+        accept_licenses: bool = False,
+    ) -> tuple[int, str]:
+        sdkmanager_bin = (sdkmanager_bin or self.derived_paths()["sdkmanager"]).strip()
+        stdin_text = ("y\n" * 256) if accept_licenses else None
+        return self._run_sync_with_input([sdkmanager_bin, package], "sdkmanager-install-image", stdin_text=stdin_text)
+
+    def update_system_image(
+        self,
+        package: str,
+        sdkmanager_bin: str | None = None,
+        accept_licenses: bool = False,
+    ) -> tuple[int, str]:
+        sdkmanager_bin = (sdkmanager_bin or self.derived_paths()["sdkmanager"]).strip()
+        stdin_text = ("y\n" * 256) if accept_licenses else None
+        return self._run_sync_with_input([sdkmanager_bin, package], "sdkmanager-update-image", stdin_text=stdin_text)
+
+    def accept_licenses(self, sdkmanager_bin: str | None = None) -> tuple[int, str]:
+        sdkmanager_bin = (sdkmanager_bin or self.derived_paths()["sdkmanager"]).strip()
+        return self._run_sync_with_input([sdkmanager_bin, "--licenses"], "sdkmanager-licenses", stdin_text=("y\n" * 256))
 
     def create_avd(
         self,

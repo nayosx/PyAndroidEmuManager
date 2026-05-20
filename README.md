@@ -101,13 +101,13 @@ pip install pyinstaller
 ## Compilar
 
 ```bash
-pyinstaller --clean --windowed --icon app.icns --name "Py Android Emu Manager" py-avd.py
+pyinstaller --clean --windowed --icon app.icns --name "Android Emu Manager" py-avd.py
 ```
 
 ## Resultado
 
 ```text
-dist/Py Android Emu Manager.app
+dist/Android Emu Manager.app
 ```
 
 ---
@@ -124,7 +124,7 @@ pip install flet
 
 ```bash
 flet pack flet_avd.py \
-  --name "Py Android Emu Manager Flet" \
+  --name "Android Emu Manager Flet" \
   --icon android.icns \
   --add-data "mobile.png:."
 ```
@@ -134,7 +134,7 @@ flet pack flet_avd.py \
 ## Resultado
 
 ```text
-dist/Py Android Emu Manager Flet.app
+dist/Android Emu Manager Flet.app
 ```
 
 ---
@@ -145,14 +145,14 @@ Firmar localmente la app usando ad-hoc signing:
 
 ```bash
 codesign --force --deep --sign - \
-  "dist/Py Android Emu Manager Flet.app"
+  "dist/Android Emu Manager Flet.app"
 ```
 
 Luego comprimir:
 
 ```bash
 ditto -c -k --keepParent \
-  "dist/Py Android Emu Manager Flet.app" \
+  "dist/Android Emu Manager Flet.app" \
   "PyAndroidEmuManagerFlet.zip"
 ```
 
@@ -165,13 +165,13 @@ Esta app no está notarizada por Apple.
 Si macOS bloquea la apertura, ejecutar:
 
 ```bash
-xattr -dr com.apple.quarantine "dist/Py Android Emu Manager Flet.app"
+xattr -dr com.apple.quarantine "dist/Android Emu Manager Flet.app"
 ```
 
 Luego abrir:
 
 ```bash
-open "dist/Py Android Emu Manager Flet.app"
+open "dist/Android Emu Manager Flet.app"
 ```
 
 ---
@@ -196,7 +196,7 @@ source .venv/bin/activate
 
 ```bash
 pip install pyinstaller
-pyinstaller --clean --windowed --name "Py Android Emu Manager" py-avd.py
+pyinstaller --clean --windowed --name "Android Emu Manager" py-avd.py
 ```
 
 ## Versión Flet
@@ -204,7 +204,7 @@ pyinstaller --clean --windowed --name "Py Android Emu Manager" py-avd.py
 ```bash
 pip install flet
 flet pack flet_avd.py \
-  --name "Py Android Emu Manager Flet" \
+  --name "Android Emu Manager Flet" \
   --icon android.icns \
   --add-data "mobile.png:."
 ```
@@ -235,7 +235,7 @@ py -m venv .venv
 
 ```bash
 pip install pyinstaller
-pyinstaller --clean --windowed --name "Py Android Emu Manager" py-avd.py
+pyinstaller --clean --windowed --name "Android Emu Manager" py-avd.py
 ```
 
 ## Versión Flet
@@ -243,7 +243,7 @@ pyinstaller --clean --windowed --name "Py Android Emu Manager" py-avd.py
 ```bash
 pip install flet
 flet pack flet_avd.py \
-  --name "Py Android Emu Manager Flet" \
+  --name "Android Emu Manager Flet" \
   --icon android.icns \
   --add-data "mobile.png:."
 ```
